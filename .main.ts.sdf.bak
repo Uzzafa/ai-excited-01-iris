@@ -1,0 +1,631 @@
+// SPDX-License-Identifier: MIT
+// IRIS ENGINE — a colossal eye of light caught the instant before it opens.
+// Zero dependencies (node:zlib / node:fs / node:path only), deterministic:
+// no randomness anywhere — every variation is an integer hash of a coordinate
+// or a blade index, so two runs are byte-identical.
+
+import { deflateSync } from 'node:zlib';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const T0 = Date.now();
+
+const W = 1024;
+const H = 1024;
+
+const PI = Math.PI;
+const TAU = PI * 2;
+
+function clamp(x: number, a: number, b: number) { return x < a ? a : x > b ? b : x; }
+function mix(a: number, b: number, t: number) { return a + (b - a) * t; }
+function sstep(a: number, b: number, x: number) {
+  const t = clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+function length3(x: number, y: number, z: number) { return Math.sqrt(x * x + y * y + z * z); }
+
+// 32-bit integer hash -> [0,1)
+function hash3(a: number, b: number, c: number) {
+  let h = Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul(b | 0, 0x165667b1) ^ Math.imul(c | 0, 0x9e3779b1);
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+  h = Math.imul(h ^ (h >>> 12), 0x297a2d39);
+  h ^= h >>> 15;
+  return (h >>> 0) / 4294967296;
+}
+
+// ---------------------------------------------------------------- camera
+
+const CAMX = 2.5, CAMY = -1.7, CAMZ = 6.6;
+const EYE_SCALE = 0.62; // shrink the eye in world units so the whole engine fits the frame
+const FOV = 50 * PI / 180;
+const ROLL = 7 * PI / 180;
+const TANH = Math.tan(FOV * 0.5);
+
+let fwdX = -CAMX, fwdY = -CAMY, fwdZ = -CAMZ;
+{
+  const l = length3(fwdX, fwdY, fwdZ);
+  fwdX /= l; fwdY /= l; fwdZ /= l;
+}
+let rgtX = fwdZ, rgtY = 0, rgtZ = -fwdX;
+{
+  const l = length3(rgtX, rgtY, rgtZ);
+  rgtX /= l; rgtY /= l; rgtZ /= l;
+}
+let upX = rgtY * fwdZ - rgtZ * fwdY;
+let upY = rgtZ * fwdX - rgtX * fwdZ;
+let upZ = rgtX * fwdY - rgtY * fwdX;
+{
+  const cr = Math.cos(ROLL), sr = Math.sin(ROLL);
+  const a = rgtX * cr + upX * sr, b = rgtY * cr + upY * sr, c = rgtZ * cr + upZ * sr;
+  const d = upX * cr - rgtX * sr, e = upY * cr - rgtY * sr, f = upZ * cr - rgtZ * sr;
+  rgtX = a; rgtY = b; rgtZ = c;
+  upX = d; upY = e; upZ = f;
+}
+
+// eye centre sits at 0.55 across and 0.48 down the frame
+// the origin projects to u=v=0, i.e. dead centre, so the frame is shifted the
+// other way to drop it to 0.55 across / 0.48 down
+const SHIFT_X = -(0.55 * 2 - 1) * TANH;
+const SHIFT_Y = (0.48 * 2 - 1) * TANH;
+
+// three tilted frames for the plasma arcs: ring i lives in the plane (Ai, Bi)
+const AX0 = 0.94, AY0 = 0.26, AZ0 = -0.20;
+const BX0 = 0.16, BY0 = 0.34, BZ0 = 0.93;
+const AX1 = 0.22, AY1 = 0.94, AZ1 = 0.26;
+const BX1 = 0.90, BY1 = -0.10, BZ1 = -0.42;
+const AX2 = -0.18, AY2 = 0.32, AZ2 = 0.93;
+const BX2 = 0.88, BY2 = -0.44, BZ2 = 0.10;
+
+// ---------------------------------------------------------------- materials
+
+const M_NONE = 0;
+const M_PUPIL = 1;
+const M_BLADE = 2;
+const M_BED = 3;
+const M_RIM = 4;
+const M_ARC = 5;
+const M_SHOCK = 6;
+
+const IRIS_OUTSET = 0.86;   // outer radius of the blade ring
+const IB = 48;              // blades around the full circle
+const ISEG = TAU / IB;
+const R_IN_OPEN = 0.42;     // inner radius on the fully open side
+
+// state written by the fields below: which surface the marcher is nearest
+let hitMat = M_NONE;
+let hitBlade = 0;
+
+// --- the iris body -----------------------------------------------------------
+// A solid plate between rIn(theta) and rOut. Blades are carved into it as
+// angular grooves rather than holes, which keeps the field continuous, keeps
+// the marcher stable and still gives crisp dark seams between plates.
+function sdIrisBody(x: number, y: number, z: number) {
+  const rho = Math.sqrt(x * x + y * y);
+  if (rho < 1e-5) { hitMat = M_BED; return 0.42; }
+
+  // blades retract on +x and thrust inward on -x: the aperture is asymmetric
+  const ca = x / rho;
+  const open = 0.5 + 0.5 * ca;
+  const shut = 1 - open;
+  const rIn = R_IN_OPEN + 0.55 * shut * shut * (1.5 - 0.5 * shut);
+  const rOut = IRIS_OUTSET;
+  const dr = Math.max(rIn - rho, rho - rOut);
+
+  // angular coordinate inside the wedge this blade owns
+  const ang = Math.atan2(y, x);
+  const id = Math.round(ang / ISEG);
+  const q = (ang - id * ISEG) / ISEG; // -0.5..0.5 across the wedge
+
+  // The plate is solid across its wedge; a narrow channel is carved near the
+  // wedge edge so consecutive blades read as separate plates.
+  const gw = 0.16 + 0.07 * hash3(id, 71, 19);
+  const groove = (Math.abs(q) - (0.5 - gw)) * rho;
+
+  // the plate scrolls out of the plane, and thins toward the aperture
+  const scroll = (rho - rIn) * (hash3(id, 29, 7) - 0.5) * 0.55;
+  const thick = 0.010 + 0.030 * sstep(0.0, 0.34, rho - rIn);
+  const dz = Math.abs(z + scroll) - thick;
+
+  // the plate is the *intersection* of the radial band, the angular half-space
+  // and the out-of-plane slab. Take the in-plane field first, exactly, then
+  // combine it with the slab so both must be satisfied for a hit.
+  const ox = Math.max(groove, 0);
+  const oy = Math.max(dr, 0);
+  const dPlanar = Math.sqrt(ox * ox + oy * oy) + Math.min(Math.max(groove, dr), 0);
+  const d = Math.max(dPlanar, dz);
+
+  hitMat = M_BLADE;
+  hitBlade = id;
+  return d;
+}
+
+// pupil slit: a flattened ellipsoid 0.10 x 0.30 x 0.09. The scaled-sphere form
+// is exact at the centre and Lipschitz-bounded everywhere.
+function sdPupil(x: number, y: number, z: number) {
+  const u = x / 0.100, v = y / 0.300, w = z / 0.090;
+  const k = Math.sqrt(u * u + v * v + w * w);
+  if (k < 1e-7) return -0.100;
+  return (k - 1) / Math.sqrt(u * u / 0.01 + v * v / 0.09 + w * w / 0.0081 + 1e-12);
+}
+
+function mapIris(x: number, y: number, z: number) {
+  const dp = sdPupil(x, y, z);
+  const db = sdIrisBody(x, y, z);
+
+  let d = db;
+  let mat = hitMat;
+
+  if (dp < d) { d = dp; mat = M_PUPIL; }
+
+  // a hard bright rim on the pupil silhouette, local to the pupil only
+  if (dp < 0.04) {
+    const drim = Math.abs(dp + 0.0024) - 0.0032;
+    if (drim < d) { d = drim; mat = M_RIM; }
+  }
+
+  hitMat = mat;
+  return d;
+}
+
+function mapArc(px: number, py: number, pz: number, ax: number, ay: number, az: number,
+  bx: number, by: number, bz: number, R: number, tube: number) {
+  // radial distance in the ring plane plus the normalised out-of-plane offset
+  const p = px * ax + py * ay + pz * az;
+  const q = px * bx + py * by + pz * bz;
+  const nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+  const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+  const w = (px * nx + py * ny + pz * nz) / nl;
+  const e = Math.sqrt(p * p + q * q) - R;
+  return Math.sqrt(e * e + w * w) - tube;
+}
+
+const SHOCK_CX = 0.30, SHOCK_CY = -0.98, SHOCK_R = 1.30;
+
+function map(x: number, y: number, z: number) {
+  const r2 = x * x + y * y + z * z;
+  if (r2 > 4.2) return Math.sqrt(r2) - 2.05;
+
+  let d = mapIris(x, y, z);
+  let mat = hitMat;
+  let bl = hitBlade;
+
+  const a0 = mapArc(x, y, z, AX0, AY0, AZ0, BX0, BY0, BZ0, 1.20, 0.0110);
+  if (a0 < d) { d = a0; mat = M_ARC; bl = 0; }
+  const a1 = mapArc(x, y, z, AX1, AY1, AZ1, BX1, BY1, BZ1, 1.52, 0.0098);
+  if (a1 < d) { d = a1; mat = M_ARC; bl = 1; }
+  const a2 = mapArc(x, y, z, AX2, AY2, AZ2, BX2, BY2, BZ2, 1.86, 0.0086);
+  if (a2 < d) { d = a2; mat = M_ARC; bl = 2; }
+
+  // one off-axis shockwave, low and tilted: it breaks the bullseye
+  {
+    const sx = x - SHOCK_CX, sy = y - SHOCK_CY;
+    const u = sx * 0.93 + z * 0.37;
+    const w = z * 0.93 - sx * 0.37;
+    const e = Math.sqrt(u * u + sy * sy) - SHOCK_R;
+    const sw = Math.sqrt(e * e + w * w) - 0.0070;
+    if (sw < d) { d = sw; mat = M_SHOCK; }
+  }
+
+  hitMat = mat;
+  hitBlade = bl;
+  return d;
+}
+
+function march(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number) {
+  const b = ox * dx + oy * dy + oz * dz;
+  const c = ox * ox + oy * oy + oz * oz - 4.3;
+  const disc = b * b - c;
+  if (disc <= 0) { hitMat = M_NONE; return -1; }
+  const sq = Math.sqrt(disc);
+  let t = -b - sq;
+  if (t < 0) t = -b + sq;
+  if (t < 0) { hitMat = M_NONE; return -1; }
+
+  for (let i = 0; i < 128; i++) {
+    const px = ox + dx * t, py = oy + dy * t, pz = oz + dz * t;
+    const d = map(px, py, pz);
+    if (d < 0.0009 * t + 0.0005) return t;
+    t += d * 0.9 + 0.0009;
+    if (t > 9) break;
+  }
+  hitMat = M_NONE;
+  return -1;
+}
+
+// ---------------------------------------------------------------- emission
+
+// iris gradient: white-gold at the inner tip, amber, crimson, violet at the rim
+function bladeEmissive(rho: number, id: number, th: number, out: Float64Array) {
+  const t = clamp((rho - 0.42) / 0.44, 0, 1);
+  let cr: number, cg: number, cb: number;
+  if (t < 0.33) {
+    const u = t / 0.33;
+    cr = mix(1.15, 1.30, u); cg = mix(1.02, 0.62, u); cb = mix(0.60, 0.07, u);
+  } else if (t < 0.68) {
+    const u = (t - 0.33) / 0.35;
+    cr = mix(1.30, 1.08, u); cg = mix(0.62, 0.11, u); cb = mix(0.07, 0.24, u);
+  } else {
+    const u = (t - 0.68) / 0.32;
+    cr = mix(1.08, 0.34, u); cg = mix(0.11, 0.18, u); cb = mix(0.24, 0.78, u);
+  }
+  const hb = hash3(id, 5, 1);
+  const open = 0.5 + 0.5 * Math.cos(th);
+  const gain = 0.22 + 0.55 * hb * hb + 0.38 * open * open;
+  const tip = 1 + 1.1 * Math.exp(-((rho - 0.50) * (rho - 0.50)) / 0.0060);
+  const k = gain * tip;
+  out[0] = cr * k; out[1] = cg * k; out[2] = cb * k;
+}
+
+const tmpc = new Float64Array(3);
+
+// ---------------------------------------------------------------- dust
+
+const specks: number[] = [];
+const NS = 320;
+for (let i = 0; i < NS; i++) {
+  const a = hash3(i, 301, 1) * TAU;
+  const rr = 0.28 + Math.pow(hash3(i, 302, 2), 0.7) * 1.55;
+  const curl = 0.60 * Math.sin(rr * 1.35 + a * 2.2);
+  specks.push(
+    Math.cos(a + curl) * rr,
+    Math.sin(a + curl) * rr * 0.92 + 0.05,
+    (hash3(i, 303, 3) - 0.5) * 1.9,
+    0.05 + 0.85 * Math.pow(hash3(i, 304, 4), 3.2),
+    0.0018 + 0.0042 * hash3(i, 305, 5));
+}
+const streaks: number[] = [];
+const NX = 18;
+for (let i = 0; i < NX; i++) {
+  const a = hash3(i, 401, 1) * TAU;
+  const rr = 0.62 + Math.pow(hash3(i, 402, 2), 0.65) * 1.35;
+  const curl = 0.9 * (hash3(i, 403, 3) - 0.5);
+  const ang = a + 0.55 * curl;
+  streaks.push(
+    Math.cos(a) * rr, Math.sin(a) * rr * 0.94 + 0.03, (hash3(i, 404, 4) - 0.5) * 1.5,
+    Math.cos(ang), Math.sin(ang),
+    0.18 + 1.0 * hash3(i, 405, 5),
+    0.09 + 0.25 * hash3(i, 406, 6));
+}
+
+// ---------------------------------------------------------------- shading
+
+function shade(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, out: Float64Array) {
+  out[0] = 0; out[1] = 0; out[2] = 0;
+  const t = march(ox, oy, oz, dx, dy, dz);
+  const m = hitMat;
+  let tie = t;
+
+  if (t > 0) {
+    const hx = ox + dx * t, hy = oy + dy * t, hz = oz + dz * t;
+    const rho = Math.sqrt(hx * hx + hy * hy);
+    if (m === M_BLADE) {
+      const th = Math.atan2(hy, hx);
+      bladeEmissive(rho, hitBlade, th, tmpc);
+      const id = hitBlade;
+      const localU = (th - id * ISEG) * rho * 3.4;
+      const groove = 0.70 + 0.46 * Math.cos(clamp(localU / (ISEG * 0.52), -1, 1) * PI * 0.5);
+      const micro = 0.82 + 0.42 * Math.pow(0.5 + 0.5 * Math.cos(localU * 26 + id * 2.1), 8);
+      const pulse = 0.86 + 0.22 * Math.sin(rho * 24 - id * 0.4 + th * 3);
+      const inTip = 0.6 + 0.65 * sstep(0.0, 0.22, rho - 0.42);
+      const k = groove * micro * pulse * inTip;
+      out[0] = tmpc[0] * k; out[1] = tmpc[1] * k; out[2] = tmpc[2] * k;
+    } else if (m === M_PUPIL) {
+      // absolute void: no light term may paint here, bloom is masked out too
+      tie = -2;
+    } else if (m === M_RIM) {
+      const th = Math.atan2(hy, hx);
+      const hl = hash3(Math.round(th * 16), 9, 2);
+      const k = 0.55 + 0.75 * hl;
+      const cool = 0.5 - 0.5 * Math.cos(th);
+      out[0] = 1.02 * k + 0.22 * k * cool;
+      out[1] = 0.98 * k + 0.50 * k * cool;
+      out[2] = 0.90 * k + 0.92 * k * cool;
+    } else if (m === M_ARC) {
+      const i = hitBlade;
+      let p = 0, q = 0;
+      if (i === 0) {
+        p = hx * AX0 + hy * AY0 + hz * AZ0; q = hx * BX0 + hy * BY0 + hz * BZ0;
+      } else if (i === 1) {
+        p = hx * AX1 + hy * AY1 + hz * AZ1; q = hx * BX1 + hy * BY1 + hz * BZ1;
+      } else {
+        p = hx * AX2 + hy * AY2 + hz * AZ2; q = hx * BX2 + hy * BY2 + hz * BZ2;
+      }
+      const ang = Math.atan2(q, p);
+      const modm = 0.14 + 0.86 * Math.pow(0.5 + 0.5 * Math.sin(ang * 2.0 + i * 2.1), 2.3);
+      const haze = 0.20 + 0.80 * sstep(-3.2, 0.8, hz);
+      const k = modm * haze * 1.05;
+      if (i === 0) { out[0] = 0.18 * k; out[1] = 0.88 * k; out[2] = 1.12 * k; }
+      else if (i === 1) { out[0] = 0.58 * k; out[1] = 0.30 * k; out[2] = 1.15 * k; }
+      else { out[0] = 0.24 * k; out[1] = 0.96 * k; out[2] = 1.06 * k; }
+    } else if (m === M_SHOCK) {
+      const ang = Math.atan2(hy - SHOCK_CY, (hx - SHOCK_CX) * 0.93 + hz * 0.37);
+      const modm = 0.42 + 0.80 * Math.pow(0.5 + 0.5 * Math.sin(ang * 1.5 + 0.7), 2);
+      const k = 1.55 * modm;
+      out[0] = 1.18 * k; out[1] = 1.10 * k; out[2] = 0.92 * k;
+    }
+  } else {
+    // faint depth haze so the background is not dead flat black
+    out[0] = 0.00132; out[1] = 0.00118; out[2] = 0.00420;
+  }
+
+  // dust: analytic ray-to-point / ray-to-segment, occluded by the primary hit
+  for (let i = 0; i < specks.length; i += 5) {
+    const sx = specks[i] - ox, sy = specks[i + 1] - oy, sz = specks[i + 2] - oz;
+    const tc = sx * dx + sy * dy + sz * dz;
+    if (tc < 0.3 || tc > tie) continue;
+    const px = sx - dx * tc, py = sy - dy * tc, pz = sz - dz * tc;
+    const d2 = px * px + py * py + pz * pz;
+    if (d2 > 0.00010) continue;
+    const rad = specks[i + 4];
+    if (d2 > rad * rad * 4.2) continue;
+    const w = specks[i + 3] * Math.exp(-d2 / (rad * rad * 1.15)) / (1 + 0.05 * tc * tc);
+    out[0] += 0.64 * w; out[1] += 0.68 * w; out[2] += 0.94 * w;
+  }
+  for (let i = 0; i < streaks.length; i += 7) {
+    const sx = streaks[i] - ox, sy = streaks[i + 1] - oy, sz = streaks[i + 2] - oz;
+    const tc = sx * dx + sy * dy + sz * dz;
+    if (tc < 0.3 || tc > tie) continue;
+    const px = sx - dx * tc, py = sy - dy * tc, pz = sz - dz * tc;
+    if (px * px + py * py > 0.005) continue;
+    const ax = streaks[i + 3], ay = streaks[i + 4];
+    const along = px * ax + py * ay;
+    const L = streaks[i + 6];
+    if (along > L || along < -L) continue;
+    const qx = px - ax * along, qy = py - ay * along;
+    const d2 = qx * qx + qy * qy + pz * pz * 2.0;
+    const w = streaks[i + 5] * Math.exp(-d2 / 0.000042) * sstep(L, L * 0.12, Math.abs(along)) / (1 + 0.04 * tc * tc);
+    out[0] += 0.36 * w; out[1] += 0.64 * w; out[2] += 0.98 * w;
+  }
+}
+
+// ---------------------------------------------------------------- render
+
+const hdr = new Float64Array(W * H * 3);
+const res = new Float64Array(3);
+const SUBX = [0.125, 0.625, 0.375, 0.875];
+const SUBY = [0.375, 0.125, 0.875, 0.625];
+
+for (let y = 0; y < H; y++) {
+  const vy0 = -((y / H) * 2 - 1) * TANH + SHIFT_Y;
+  for (let x = 0; x < W; x++) {
+    const ux0 = ((x / W) * 2 - 1) * TANH + SHIFT_X;
+    let ar = 0, ag = 0, ab = 0;
+    for (let s = 0; s < 4; s++) {
+      const u = ux0 + (SUBX[s] / W) * 2 * TANH;
+      const v = vy0 - (SUBY[s] / H) * 2 * TANH;
+      const dx = fwdX + rgtX * u + upX * v;
+      const dy = fwdY + rgtY * u + upY * v;
+      const dz = fwdZ + rgtZ * u + upZ * v;
+      const il = 1 / length3(dx, dy, dz);
+      shade(CAMX, CAMY, CAMZ, dx * il, dy * il, dz * il, res);
+      ar += res[0]; ag += res[1]; ab += res[2];
+    }
+    const o = (y * W + x) * 3;
+    hdr[o] = ar * 0.25; hdr[o + 1] = ag * 0.25; hdr[o + 2] = ab * 0.25;
+  }
+}
+
+const TM1 = Date.now();
+
+// ---------------------------------------------------------------- bloom
+
+function downsample(src: Float64Array, w: number, h: number, nw: number, nh: number, thresh: number) {
+  const dst = new Float64Array(nw * nh * 3);
+  const fx = (w / nw) | 0, fy = (h / nh) | 0;
+  for (let y = 0; y < nh; y++) {
+    for (let x = 0; x < nw; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let yy = 0; yy < fy; yy++) {
+        for (let xx = 0; xx < fx; xx++) {
+          const o = ((y * fy + yy) * w + x * fx + xx) * 3;
+          r += src[o]; g += src[o + 1]; b += src[o + 2];
+        }
+      }
+      const k = 1 / (fx * fy);
+      r *= k; g *= k; b *= k;
+      if (thresh > 0) {
+        const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const mm = sstep(thresh, thresh * 2.8, lum);
+        r *= mm; g *= mm; b *= mm;
+      }
+      const o = (y * nw + x) * 3;
+      dst[o] = r; dst[o + 1] = g; dst[o + 2] = b;
+    }
+  }
+  return dst;
+}
+
+function blur(src: Float64Array, w: number, h: number, rad: number) {
+  const tmp = new Float64Array(src.length);
+  const n = rad * 2 + 1;
+  for (let y = 0; y < h; y++) {
+    for (let c = 0; c < 3; c++) {
+      let acc = 0;
+      for (let k = -rad; k <= rad; k++) acc += src[(y * w + clamp(k, 0, w - 1)) * 3 + c];
+      for (let x = 0; x < w; x++) {
+        tmp[(y * w + x) * 3 + c] = acc / n;
+        acc += src[(y * w + Math.min(x + rad + 1, w - 1)) * 3 + c] - src[(y * w + Math.max(x - rad, 0)) * 3 + c];
+      }
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    for (let c = 0; c < 3; c++) {
+      let acc = 0;
+      for (let k = -rad; k <= rad; k++) acc += tmp[(clamp(k, 0, h - 1) * w + x) * 3 + c];
+      for (let y = 0; y < h; y++) {
+        src[(y * w + x) * 3 + c] = acc / n;
+        acc += tmp[(Math.min(y + rad + 1, h - 1) * w + x) * 3 + c] - tmp[(Math.max(y - rad, 0) * w + x) * 3 + c];
+      }
+    }
+  }
+}
+
+const B1W = W >> 1, B1H = H >> 1;
+const B2W = W >> 2, B2H = H >> 2;
+const B3W = W >> 3, B3H = H >> 3;
+const B4W = W >> 4, B4H = H >> 4;
+
+const B1 = downsample(hdr, W, H, B1W, B1H, 0.85);
+blur(B1, B1W, B1H, 2);
+const B2 = downsample(B1, B1W, B1H, B2W, B2H, 0);
+blur(B2, B2W, B2H, 3);
+const B3 = downsample(B2, B2W, B2H, B3W, B3H, 0);
+blur(B3, B3W, B3H, 4);
+const B4 = downsample(B3, B3W, B3H, B4W, B4H, 0);
+blur(B4, B4W, B4H, 5);
+
+// the void must stay void: carve the pupil silhouette out of the bloom so no
+// halo paints across the slit. tested at half res, dilated when applied.
+const PMW = W >> 1, PMH = H >> 1;
+const pupilMask = new Uint8Array(PMW * PMH);
+for (let y = 0; y < PMH; y++) {
+  for (let x = 0; x < PMW; x++) {
+    const u = (((x + 0.5) / PMW) * 2 - 1) * TANH + SHIFT_X;
+    const v = -(((y + 0.5) / PMH) * 2 - 1) * TANH + SHIFT_Y;
+    let dx = fwdX + rgtX * u + upX * v;
+    let dy = fwdY + rgtY * u + upY * v;
+    let dz = fwdZ + rgtZ * u + upZ * v;
+    const il = 1 / length3(dx, dy, dz);
+    dx *= il; dy *= il; dz *= il;
+    const tc = -(CAMX * dx + CAMY * dy + CAMZ * dz);
+    pupilMask[y * PMW + x] = sdPupil(CAMX + dx * tc, CAMY + dy * tc, CAMZ + dz * tc) < 0.012 ? 1 : 0;
+  }
+}
+
+function sampleBilinear(src: Float64Array, lw: number, lh: number, u: number, v: number, out: Float64Array) {
+  const fx = clamp(u * lw - 0.5, 0, lw - 1.001);
+  const fy = clamp(v * lh - 0.5, 0, lh - 1.001);
+  const x0 = fx | 0, y0 = fy | 0;
+  const tx = fx - x0, ty = fy - y0;
+  const x1 = Math.min(x0 + 1, lw - 1), y1 = Math.min(y0 + 1, lh - 1);
+  const o00 = (y0 * lw + x0) * 3, o10 = (y0 * lw + x1) * 3;
+  const o01 = (y1 * lw + x0) * 3, o11 = (y1 * lw + x1) * 3;
+  for (let c = 0; c < 3; c++) {
+    const a = src[o00 + c] + (src[o10 + c] - src[o00 + c]) * tx;
+    const b = src[o01 + c] + (src[o11 + c] - src[o01 + c]) * tx;
+    out[c] = a + (b - a) * ty;
+  }
+}
+
+// ---------------------------------------------------------------- tonemap + write
+
+function aces(x: number) {
+  const a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0, 1.0);
+}
+function srgb(x: number) {
+  return x <= 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
+}
+
+const rgb = new Uint8Array(W * H * 3);
+const bb = new Float64Array(3);
+
+for (let y = 0; y < H; y++) {
+  const v = y / H;
+  const my = y >> 1;
+  for (let x = 0; x < W; x++) {
+    const o = (y * W + x) * 3;
+    const u = x / W;
+
+    let r = hdr[o], g = hdr[o + 1], b = hdr[o + 2];
+
+    // bloom mask: dilated pupil silhouette
+    const mx = x >> 1;
+    let hit = 0;
+    for (let j = -1; j <= 1 && hit === 0; j++) {
+      const yy = my + j;
+      if (yy < 0 || yy >= PMH) continue;
+      for (let i = -1; i <= 1; i++) {
+        const xx = mx + i;
+        if (xx < 0 || xx >= PMW) continue;
+        if (pupilMask[yy * PMW + xx]) { hit = 1; break; }
+      }
+    }
+    const mk = hit ? 0 : 1;
+
+    sampleBilinear(B1, B1W, B1H, u, v, bb); r += bb[0] * 0.34 * mk; g += bb[1] * 0.34 * mk; b += bb[2] * 0.34 * mk;
+    sampleBilinear(B2, B2W, B2H, u, v, bb); r += bb[0] * 0.30 * mk; g += bb[1] * 0.30 * mk; b += bb[2] * 0.30 * mk;
+    sampleBilinear(B3, B3W, B3H, u, v, bb); r += bb[0] * 0.26 * mk; g += bb[1] * 0.26 * mk; b += bb[2] * 0.26 * mk;
+    sampleBilinear(B4, B4W, B4H, u, v, bb); r += bb[0] * 0.20 * mk; g += bb[1] * 0.20 * mk; b += bb[2] * 0.20 * mk;
+
+    // vignette
+    const cx = x / W - 0.5, cy = y / H - 0.5;
+    const vg = 1 - 0.32 * Math.pow(clamp((cx * cx + cy * cy) * 2.1, 0, 1.1), 1.15);
+    r *= vg; g *= vg; b *= vg;
+
+    r = srgb(aces(r));
+    g = srgb(aces(g));
+    b = srgb(aces(b));
+
+    // triangular dither from two hashed values (+-0.5 LSB), plus 1 LSB grain
+    const d1 = hash3(x, y, 0x51ed);
+    const d2 = hash3(x + 7919, y + 104729, 0x2545);
+    const tri = (d1 + d2 - 1) * 0.5;
+    const gr = (hash3(x + 31337, y + 7, 0x9e37) - 0.5) * 0.85;
+    rgb[o] = clamp(Math.round(r * 255 + tri + gr), 0, 255);
+    rgb[o + 1] = clamp(Math.round(g * 255 + tri + gr), 0, 255);
+    rgb[o + 2] = clamp(Math.round(b * 255 + tri + gr), 0, 255);
+  }
+}
+
+// ---------------------------------------------------------------- PNG encoder
+
+const crcTable = new Int32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  crcTable[n] = c;
+}
+function crc32(buf: Uint8Array, start: number, end: number) {
+  let c = -1;
+  for (let i = start; i < end; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+function chunk(type: string, data: Uint8Array) {
+  const out = new Uint8Array(12 + data.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, data.length);
+  out[4] = type.charCodeAt(0); out[5] = type.charCodeAt(1);
+  out[6] = type.charCodeAt(2); out[7] = type.charCodeAt(3);
+  out.set(data, 8);
+  dv.setUint32(8 + data.length, crc32(out, 4, 8 + data.length));
+  return out;
+}
+
+function encodePNG(w: number, h: number, pix: Uint8Array) {
+  const stride = w * 3 + 1;
+  const raw = new Uint8Array(stride * h);
+  for (let y = 0; y < h; y++) {
+    const ro = y * stride, po = y * w * 3;
+    raw[ro] = 1; // Sub filter keeps the dithered gradients compressible
+    for (let i = 0; i < w * 3; i++) {
+      raw[ro + 1 + i] = (pix[po + i] - (i >= 3 ? pix[po + i - 3] : 0)) & 0xff;
+    }
+  }
+  const idat = deflateSync(raw, { level: 9, memLevel: 9 });
+
+  const ihdr = new Uint8Array(13);
+  const d = new DataView(ihdr.buffer);
+  d.setUint32(0, w); d.setUint32(4, h);
+  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+
+  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const cIHDR = chunk('IHDR', ihdr);
+  const cIDAT = chunk('IDAT', idat);
+  const cIEND = chunk('IEND', new Uint8Array(0));
+  const total = sig.length + cIHDR.length + cIDAT.length + cIEND.length;
+  const file = new Uint8Array(total);
+  let off = 0;
+  for (const p of [sig, cIHDR, cIDAT, cIEND]) { file.set(p, off); off += p.length; }
+  return file;
+}
+
+const png = encodePNG(W, H, rgb);
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+mkdirSync(outDir, { recursive: true });
+writeFileSync(join(outDir, 'entry.png'), png);
+
+// read the dimensions back out of the IHDR bytes to prove the encoder
+const ih = new DataView(png.buffer, png.byteOffset + 16, 8);
+console.log(`IHDR ${ih.getUint32(0)}x${ih.getUint32(4)}  bytes=${png.length}`);
+console.log(`render ${TM1 - T0} ms, post ${Date.now() - TM1} ms, total ${Date.now() - T0} ms`);
