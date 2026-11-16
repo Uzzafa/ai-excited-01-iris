@@ -83,7 +83,7 @@ const bHue = new Float64Array(NB);
 const bInner = new Float64Array(NB);
 for (let i = 0; i < NB; i++) {
   bReach[i] = 0.30 + 0.48 * Math.pow(hsh(i, 11, 1), 0.85);
-  bBright[i] = 0.46 + 0.54 * hsh(i, 23, 2);
+  bBright[i] = 0.62 + 0.38 * hsh(i, 23, 2);
   bSkew[i] = (hsh(i, 37, 3) - 0.5) * 0.30;
   bHue[i] = hsh(i, 53, 4);
   bInner[i] = 0.008 + 0.030 * hsh(i, 67, 5);
@@ -196,13 +196,13 @@ function sample(u: number, v: number): void {
 
   // --- pupil: absolute void, then a hard white-gold rim ~2 px at 1024
   if (psd < 0) { out3[0] = 0; out3[1] = 0; out3[2] = 0; return; }
-  if (psd < PIX_EDGE) {
-    const k = (1 - sstep(0, PIX_EDGE, psd)) * 2.6;
+  if (psd < PIX_EDGE * 2.0) {
+    const k = (1 - sstep(0, PIX_EDGE * 2.0, psd)) * 2.9;
     r += GOLD[0] * k; g += GOLD[1] * k; b += GOLD[2] * k;
   }
 
   // --- iris band
-  if (rad > R_IN - 2 * PIX && rad < R_OUT + 2 * PIX) {
+  if (rad > 0.10 && rad < R_OUT + 2 * PIX) {
     const a = Math.atan2(v, u);
     const bu = (a / TAU + 0.5) * NB;
     const idx = Math.floor(bu);
@@ -210,25 +210,49 @@ function sample(u: number, v: number): void {
     const frac = bu - idx;
     const skewed = frac + bSkew[i0];
 
-    // ordered stagger: the aperture hangs open on the +u side and nearly shuts on
-    // the -u side, so the ring reads as a mechanism caught mid-open
+    // Ordered stagger: the aperture hangs open on the +u side and nearly shuts on
+    // the -u side. The sweep sets the *envelope*; each blade's own hash only
+    // breaks it up. Without the shared envelope the ring is 48 independent random
+    // lengths and never reads as one mechanism caught mid-open.
     const sweep = 0.5 + 0.5 * Math.cos(a - 0.30);
-    // reach carries the sweep; brightness does not, otherwise the open side
-    // multiplies out to clipping and loses every blade seam
-    const reach = bReach[i0] * (0.66 + 0.50 * sweep * sweep);
+    const envelope = 0.74 + 0.42 * sweep * sweep;
+    const reach = bReach[i0] * envelope;
 
     const inRad = sstep(R_IN - PIX_EDGE, R_IN + PIX_EDGE, rad) * sstep(R_OUT + PIX_EDGE, R_OUT - PIX_EDGE, rad);
-    // each blade retracts to its own inner radius: on the shut side the gap under
-    // the blades opens up, on the open side they crowd the pupil
-    const inner = R_IN - 0.055 + bInner[i0] + 0.10 * (1 - sweep) * (1 - sweep);
+    // Inner edge. Each blade's tip sits on the slit's own elliptical envelope plus
+    // a small per-blade retraction, so the 48 tips trace ONE shared aperture shape
+    // (a stepped polygon hugging the pupil) instead of a free-floating ring.
+    // On the shut side the retraction grows, so the opening visibly hangs closed.
+    // Radial distance from the centre to the slit ellipse along this ray:
+    const qx = u / PUP_A, qy = v / PUP_B;
+    const qlen = Math.sqrt(qx * qx + qy * qy);
+    const pEnv = qlen > 1e-6 ? rad / qlen : PUP_A;
+    const tipBase = pEnv + 0.008 + bInner[i0] * 0.22 + 0.045 * (1 - sweep) * (1 - sweep);
+    const inner = tipBase;
     const inInner = sstep(inner - PIX_EDGE, inner + PIX_EDGE, rad);
     if (inRad > 0) {
-      // radial ramp: white-gold tip -> amber -> crimson -> violet rim
-      const t = clamp((rad - R_IN) / (R_OUT - R_IN), 0, 1);
+      // Radial ramp, keyed to position along the blade rather than absolute
+      // radius. Keyed to radius, every long blade is gold for its whole inner
+      // half, and gold at high intensity tonemaps to flat white. Keyed to the
+      // blade's own length, the gold lives just at the tip and the body carries
+      // amber, crimson and violet.
+      const tAlong = clamp((rad - inner) / Math.max(0.05, reach - inner), 0, 1);
+      const t = clamp(0.34 * tAlong + 0.66 * clamp((rad - 0.20) / (R_OUT - 0.20), 0, 1), 0, 1);
       let col: RGB;
       if (t < 0.34) col = cmix(GOLD, AMBER, t / 0.34);
       else if (t < 0.68) col = cmix(AMBER, CRIMSON, (t - 0.34) / 0.34);
       else col = cmix(CRIMSON, VIOLET, (t - 0.68) / 0.32);
+      // hold chroma: push the colour away from its own luminance, then re-clamp
+      // to <=1. The saturation boost can push a channel above 1.0; left there it
+      // multiplies straight through the intensity cap below and blows the plate
+      // to white in every channel, which is the exact failure it was meant to fix.
+      const cl = 0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2];
+      const SAT = 1.45;
+      col = [
+        clamp(cl + (col[0] - cl) * SAT, 0, 1),
+        clamp(cl + (col[1] - cl) * SAT, 0, 1),
+        clamp(cl + (col[2] - cl) * SAT, 0, 1),
+      ];
 
       // machined shading. The blade is a plate seen edge-on: a bright raised lip
       // along one edge, a flat body, then a hard fall into the dark seam where the
@@ -243,9 +267,10 @@ function sample(u: number, v: number): void {
       const shade = clamp(bevel * (1 - 0.94 * eSeam), 0.0, 1.6);
 
       // the pitch edge: a thin emissive line on one side of every blade, drawn
-      // just inside the raised lip so it does not refill the seam behind it
+      // just inside the raised lip so it does not refill the seam behind it.
+      // The falloff is floored at ~1.2 px so the line never aliases to black.
       const lineD = Math.abs(skewed - 0.20) * (TAU * rad / NB);
-      const line = sstep(1.6 * PIX, 0.2 * PIX, Math.abs(lineD)) * 1.05;
+      const line = sstep(2.0 * PIX, 0.5 * PIX, Math.abs(lineD)) * 0.95;
 
       const gain = 0.62 + 0.55 * bHue[i0];
       const inReach = sstep(reach + PIX_EDGE, reach - PIX_EDGE, rad);
@@ -256,13 +281,29 @@ function sample(u: number, v: number): void {
       // ring is not one uniformly lit band at a given radius
       const alongT = clamp((rad - inner) / Math.max(0.04, reach - inner), 0, 1);
       const lengthFade = 0.55 + 0.45 * Math.pow(1 - alongT, 0.7);
-      const lit = inRad * inInner * inReach * shade * gap * bBright[i0] * gain * 0.44 * lengthFade
-        + inRad * inInner * line * 0.34 * gap;
+      // Total plate intensity is capped well under 1.0. Above roughly 0.9 in
+      // linear light the ACES shoulder compresses all three channels toward the
+      // same value, which is what turns the open side of the ring into cream -
+      // the colour the palette is meant to avoid. Keeping the plate in the
+      // toe/mid of the curve preserves its chroma.
+      let lit = inRad * inInner * inReach * shade * gap * bBright[i0] * gain * 0.42 * lengthFade
+        + inRad * inInner * line * 0.30 * gap;
+      // fibrous texture inside the plate: fine radial striations, plus a faint
+      // cross-grain so the surface is not a flat vector fill. Pure function of
+      // (rad, blade fraction), so it costs two sines and no extra state.
+      const fibre = 0.90 + 0.10 * Math.pow(0.5 + 0.5 * Math.sin(rad * 190 + i0 * 1.7), 3);
+      const cross = 0.94 + 0.06 * Math.sin(skewed * 34 + rad * 12);
+      lit *= fibre * cross;
+      if (lit > 0.52) lit = 0.52 + (lit - 0.52) * 0.25;
       r += col[0] * lit; g += col[1] * lit; b += col[2] * lit;
 
-      // hot lip where the blades converge on the open side
-      const lip = sstep(0.040, 0.0, rad - reach) * inRad * inInner * sweep * sweep * 0.55;
-      r += GOLD[0] * lip; g += GOLD[1] * lip; b += GOLD[2] * lip;
+      // Hot lip where the blades converge. This must be a THIN band hugging the
+      // tip only: sstep(0.022, 0, rad - reach) is negative everywhere inside the
+      // plate, so written that way it fired across the whole blade and washed the
+      // open flank to cream. Gate it on proximity alone.
+      const lipD = reach - rad;   // positive inside the plate, ~0 at the tip
+      const lip = (lipD > 0 ? sstep(0.026, 0.0, lipD) : 0) * inRad * inInner * sweep * sweep * 0.85;
+      r += GOLD[0] * lip; g += GOLD[1] * lip * 0.86; b += GOLD[2] * lip * 0.62;
 
       // far-side falloff so the ring is never a flat ring
       const dim = 0.78 + 0.22 * sweep;
@@ -432,9 +473,9 @@ const B3W = W >> 3, B3H = H >> 3;
 const BL1 = downsample(hdr, W, H, B1W, B1H, 1.05);
 blur(BL1, B1W, B1H, 2);
 const BL2 = downsample(BL1, B1W, B1H, B2W, B2H, 0);
-blur(BL2, B2W, B2H, 3);
+blur(BL2, B2W, B2H, 2);
 const BL3 = downsample(BL2, B2W, B2H, B3W, B3H, 0);
-blur(BL3, B3W, B3H, 4);
+blur(BL3, B3W, B3H, 2);
 
 // the void must stay void: bloom is not allowed to paint across the slit
 const voidMask = new Uint8Array(W * H);
@@ -496,11 +537,14 @@ for (let y = 0; y < H; y++) {
     const vg = 1 - 0.36 * Math.pow(clamp((cx * cx + cy * cy) * 2.2, 0, 1.1), 1.15);
     r *= vg; g *= vg; b *= vg;
 
-    // triangular dither (+-0.5 LSB) then ~1 LSB grain, applied after the transfer
+    // triangular dither (+-0.5 LSB) then ~1 LSB grain, applied after the transfer.
+    // Grain amplitude is held at +-0.25 (+-0.5 LSB total) rather than +-0.45: the
+    // full-LSB version costs ~55 KB of deflate output and this file has a hard
+    // 1,048,576-byte cap to respect.
     const d1 = hsh(x, y, 0x51ed);
     const d2 = hsh(x + 7919, y + 104729, 0x2545);
     const tri = (d1 + d2 - 1) * 0.5;
-    const gr = (hsh(x + 31337, y + 7, 0x9e37) - 0.5) * 0.9;
+    const gr = (hsh(x + 31337, y + 7, 0x9e37) - 0.5) * 0.5;
 
     rgb[o] = clamp(Math.round(srgb(aces(r)) * 255 + tri + gr), 0, 255);
     rgb[o + 1] = clamp(Math.round(srgb(aces(g)) * 255 + tri + gr), 0, 255);
